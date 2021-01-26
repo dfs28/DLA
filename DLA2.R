@@ -20,19 +20,19 @@ patterns <- replicate(p, sample(c(1,-1), size = N, replace = TRUE))
 #patterns <- rbind(patterns, rep(1, times = p))
 
 #More efficient way of setting weights
-weight_ij <- matrix(0, nrow = N, ncol = N)
+weights <- matrix(0, nrow = N, ncol = N)
 
 for (i in 1:p) {
   
   #Multiply through the patterns to make matrix, add them together
-  weight_ij <- weight_ij + patterns[,p] %*% t(patterns[,p])
+  weights <- weights + patterns[,p] %*% t(patterns[,p])
 }
 
 #Divide by N
-weight_ij <- weight_ij/N
+weights <- weights/N
 
 #Zero off self connections
-for (i in 1:N) {weight_ij[i,i] <- 0}
+for (i in 1:N) {weights[i,i] <- 0}
 
 ##Set the weights - work through the matrix
 #for (i in 1:N) {
@@ -50,7 +50,7 @@ for (i in 1:N) {weight_ij[i,i] <- 0}
 #}
 
 #Now test the system
-v <- c(sample(c(1,-1), size = N, replace = TRUE), 1)
+v <- sample(c(1,-1), size = N, replace = TRUE)
 
 #Calculate energy
 energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
@@ -96,6 +96,20 @@ while (delta_E != 0) {
   
   #Iterate
   iterator <- iterator + 1
+  
+  if (delta_E == 0) {
+    
+   #Check if any patterns identical to current units
+   is_identical <- min(apply(patterns, 2, function(x) (length(which(x != v)))))
+   
+   if (is_identical != 0) {
+     
+     #Invert and increeas energy
+     v <- -v
+     delta_E <- 1
+     
+   }
+  }
 }
 print(v)
 t(patterns)
