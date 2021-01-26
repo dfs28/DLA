@@ -8,35 +8,61 @@ library(ggplot2)
 #Set up some parameters
 
 N <- 10
-p <- 3
+p <- 1
 #mu <- rep(-1, times = N)
 
-weights <- matrix(nrow = N, ncol = N)
+weights <- matrix(nrow = N, ncol = N + 1)
 
 #Make random pattern
 patterns <- replicate(p, sample(c(1,-1), size = N, replace = TRUE))
 
-#Set the weights - work through the matrix
-for (i in 1:N) {
-  for (j in 1:N) {
-    if (i != j) {
-      
-      #w_ij = 1/N sum x_i_mu*x_j_mu
-      weights[i, j] <- sum(sapply(1:p, function(mu) (patterns[i, mu]*patterns[j, mu])))/N
-    } else {
-      
-      #Zero off self connections
-      weights[i, j] <- 0
-        }
-  }
+#Add bias unit
+#patterns <- rbind(patterns, rep(1, times = p))
+
+#More efficient way of setting weights
+weight_ij <- matrix(0, nrow = N, ncol = N)
+
+for (i in 1:p) {
+  
+  #Multiply through the patterns to make matrix, add them together
+  weight_ij <- weight_ij + patterns[,p] %*% t(patterns[,p])
 }
 
-#Now test the system
-v <- sample(c(1,-1), size = N, replace = TRUE)
+#Divide by N
+weight_ij <- weight_ij/N
 
-#Could try running this an arbitrary number of times?
-#while (delta > 0) {
-for (j in 1:10) {
+#Zero off self connections
+for (i in 1:N) {weight_ij[i,i] <- 0}
+
+##Set the weights - work through the matrix
+#for (i in 1:N) {
+#  for (j in 1:(N+1)) {
+#    if (i != j) {
+#      
+#      #w_ij = 1/N sum x_i_mu*x_j_mu
+#      weights[i, j] <- sum(sapply(1:p, function(mu) (patterns[i, mu]*patterns[j, mu])))/N
+#    } else {
+#      
+#      #Zero off self connections
+#      weights[i, j] <- 0
+#        }
+#  }
+#}
+
+#Now test the system
+v <- c(sample(c(1,-1), size = N, replace = TRUE), 1)
+
+#Calculate energy
+energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
+delta_E <- 10
+
+#Frame to track energy
+energies <- c()
+delta_Es <- c()
+deltas <- c()
+iterator <- 1
+
+while (delta_E != 0) {
   
   #Set order to take
   order <- sample(1:N)
@@ -58,10 +84,74 @@ for (j in 1:10) {
     }
   }
   
+  #Calculate energy
+  new_energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
+  delta_Es[iterator] <- delta_E <- new_energy - energy
+  energies[iterator] <- energy <- new_energy
+  
+  #If it doesn't match one of the patterns switch the sign
+  
   print(delta)
+  print(delta_E)
+  
+  #Iterate
+  iterator <- iterator + 1
 }
 print(v)
 t(patterns)
+
+# initialize the weights using Hebb rule # loop L times
+N <- 10
+p <- 3
+
+#Make random pattern
+patterns <- replicate(p, sample(c(1,-1), size = N, replace = TRUE))
+
+#Weights
+w <- matrix(nrow = N, ncol = N)
+
+#Set the weights - work through the matrix
+for (i in 1:N) {
+  for (j in 1:N) {
+    if (i != j) {
+      
+      #w_ij = 1/N sum x_i_mu*x_j_mu
+      w[i, j] <- sum(sapply(1:p, function(mu) (patterns[i, mu]*patterns[j, mu])))/N
+    } else {
+      
+      #Zero off self connections
+      w[i, j] <- 0
+    }
+  }
+}
+
+#Make t function
+do_t <- function(x) {
+  sapply(x, function(y) (ifelse(y == 1, 1, 0)))
+}
+
+for (l in 1:L) {
+  
+  #Calculate al activations
+  a <- x %*% w
+  
+  #Do sigmoidal (compute outputs)
+  y <- 1/(1+exp(-a)) 
+  
+  #Calculate t function
+  t <- apply(x, 2, do_t)
+  e <- t - y
+  gw <- t(x) %*% e
+  gw <- gw + t(gw)
+  
+  w <- w + epsilon * (gw - alpha*w) #makestep
+  
+  #Enforce all self weights to be zero
+  for (i in 1:N) {
+    w[i,i] <-  0
+  }
+  
+}
 
 
 
