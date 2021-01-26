@@ -6,51 +6,38 @@ library(ggplot2)
 ### 2) Make hopfield network ----
 
 #Set up some parameters
-
 N <- 10
 p <- 1
-#mu <- rep(-1, times = N)
-
-weights <- matrix(nrow = N, ncol = N + 1)
 
 #Make random pattern
 patterns <- replicate(p, sample(c(1,-1), size = N, replace = TRUE))
 
-#Add bias unit
-#patterns <- rbind(patterns, rep(1, times = p))
-
 #More efficient way of setting weights
-weight_ij <- matrix(0, nrow = N, ncol = N)
-
-for (i in 1:p) {
+make_weights <- function(patterns, N, p) {
   
-  #Multiply through the patterns to make matrix, add them together
-  weight_ij <- weight_ij + patterns[,p] %*% t(patterns[,p])
+  #Initialise weight matrix
+  weights <- matrix(0, nrow = N, ncol = N)
+
+  for (i in 1:p) {
+  
+    #Multiply through the patterns to make matrix, add them together
+    weights <- weights + patterns[,p] %*% t(patterns[,p])
+
+    }
+
+  #Divide by N
+  weights <- weights/N
+
+  #Zero off self connections
+  for (i in 1:N) {weights[i,i] <- 0}
+  
+  return(weights)
 }
 
-#Divide by N
-weight_ij <- weight_ij/N
-
-#Zero off self connections
-for (i in 1:N) {weight_ij[i,i] <- 0}
-
-##Set the weights - work through the matrix
-#for (i in 1:N) {
-#  for (j in 1:(N+1)) {
-#    if (i != j) {
-#      
-#      #w_ij = 1/N sum x_i_mu*x_j_mu
-#      weights[i, j] <- sum(sapply(1:p, function(mu) (patterns[i, mu]*patterns[j, mu])))/N
-#    } else {
-#      
-#      #Zero off self connections
-#      weights[i, j] <- 0
-#        }
-#  }
-#}
+weights <- make_weights(patterns, N, p)
 
 #Now test the system
-v <- c(sample(c(1,-1), size = N, replace = TRUE), 1)
+v <- sample(c(1,-1), size = N, replace = TRUE)
 
 #Calculate energy
 energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
@@ -96,6 +83,20 @@ while (delta_E != 0) {
   
   #Iterate
   iterator <- iterator + 1
+  
+  if (delta_E == 0) {
+    
+   #Check if any patterns identical to current units
+   is_identical <- min(apply(patterns, 2, function(x) (length(which(x != v)))))
+   
+   if (is_identical != 0) {
+     
+     #Invert and increeas energy
+     v <- -v
+     delta_E <- 1
+     
+   }
+  }
 }
 print(v)
 t(patterns)
@@ -108,22 +109,7 @@ p <- 3
 patterns <- replicate(p, sample(c(1,-1), size = N, replace = TRUE))
 
 #Weights
-w <- matrix(nrow = N, ncol = N)
-
-#Set the weights - work through the matrix
-for (i in 1:N) {
-  for (j in 1:N) {
-    if (i != j) {
-      
-      #w_ij = 1/N sum x_i_mu*x_j_mu
-      w[i, j] <- sum(sapply(1:p, function(mu) (patterns[i, mu]*patterns[j, mu])))/N
-    } else {
-      
-      #Zero off self connections
-      w[i, j] <- 0
-    }
-  }
-}
+w <- make_weights(patterns, N, p)
 
 #Make t function
 do_t <- function(x) {
