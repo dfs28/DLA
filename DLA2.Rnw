@@ -1,0 +1,984 @@
+\documentclass{article}
+\usepackage[backend=biber]{biblatex}
+\usepackage{graphicx}
+\usepackage{graphicx, subfig}
+\usepackage[a4paper, total={6in, 8in}, margin = 0.65in]{geometry}
+\usepackage{hyperref}
+\usepackage{float}
+\addbibresource{~/deep_learning/DLA2_bib.bib}
+
+\title{DLA2}
+\author{404018}
+\date{January 2021}
+
+\begin{document}
+\maketitle
+
+<<setup, echo = FALSE, eval=TRUE, include=FALSE>>=
+#Set up options
+library(tidyverse)
+library(ggplot2)
+library(parallel)
+library(word2vec)
+library(wesanderson)
+N <- 100
+system(paste ("biber", sub ("\\.Rnw$", "", current_input())))
+@
+
+\section{Building a Hopfield Network}
+\subsection{Setting weights and updating network}
+I first built a function to make weights for a hopfield network and then to test the output of the networks. I tracked the energy in the system ($E = -\frac{1}{2}\sum_{ij}w_{ij}v_{i}v_{j}$) at the end of a commplete set of updates and when the change in energy fell to zero I stopped changing the units. 
+
+I found that the network sometimes settled in a state that was the inverse of one of the patterns. For this reason I allowed the function to invert all of the states of the units and then re-ran the training - it was allowed to do this twice before being forced to settle on a pattern. 
+
+<<Make_weights, echo = F, tidy = T>>=
+#More efficient way of setting weights
+make_weights <- function(patterns) {
+  #Function to make weights - patterns should be a matrix
+  #of N x p size
+  
+  #Get dimensions
+  N <- dim(patterns)[1]
+  p <- dim(patterns)[2]
+  
+  #Initialise weight matrix
+  weights <- matrix(0, nrow = N, ncol = N)
+
+  for (i in 1:p) {
+  
+    #Multiply through the patterns to make matrix, add them together
+    weights <- weights + patterns[,i] %*% t(patterns[,i])
+
+    }
+
+  #Divide by N
+  weights <- weights/N
+
+  #Zero off self connections
+  for (i in 1:N) {weights[i,i] <- 0}
+  
+  return(weights)
+}
+@
+
+
+<<Update_network,  tidy = T, echo = F>>=
+update_network <- function(weights) {
+  #Function to update network 
+  
+  #specify N
+  N <- dim(weights)[1]
+  
+  #Randomly choose a pattern to test
+  v <- sample(c(1,-1), size = N, replace = TRUE)
+  
+  #Calculate energy
+  energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
+  delta_E <- 10
+  
+  #Frame to track energy
+  energies <- c(energy)
+  delta_Es <- c(0)
+  deltas <- c(0)
+  iterator <- 2
+  
+  #Only allow sign to flip twice
+  sign_flip <- 0
+  
+  while (delta_E != 0) {
+    
+    #Set order to take
+    order <- sample(1:N)
+    delta <- 0
+    
+    #Work through the units in a random order
+    for (i in order) {
+      sgn_sum <- sum(v * weights[i,])
+      
+      #Do sgn_sum
+      if (sgn_sum > 0) {new_v <- 1
+      #} else if (sgn_sum == 0) {new_v <- 0
+      } else {new_v <- -1}
+      
+      #Check if need to keep updating units, update them
+      if (new_v != v[i]) {
+        delta <- delta + 1
+        v[i] <- new_v
+      }
+    }
+    
+    #Calculate energy
+    new_energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
+    delta_Es[iterator] <- delta_E <- new_energy - energy
+    energies[iterator] <- energy <- new_energy
+    deltas[iterator] <- delta
+    
+    #Iterate
+    iterator <- iterator + 1
+    
+    #If it doesn't match one of the patterns switch the sign
+    if (delta_E == 0 & sign_flip <= 2) {
+      
+      #Check if any patterns identical to current units
+      is_identical <- min(apply(patterns, 2, function(x) (length(which(x != v)))))
+      
+      if (is_identical != 0) {
+        
+        #Invert and increase energy
+        v <- -v
+        delta_E <- 1
+        
+        sign_flip <- sign_flip + 1  
+        
+      }
+    }
+  }
+  
+  return(list(v, data.frame(delta_Es, energies, deltas)))
+}
+@
+
+\subsection{Testing network}
+Next I tested the network with an increasing number of randomly set unique patterns. For each network I initialised the weights using the patterns then ran the network 100 times on randomly set patterns. I counted the number of times the network was unable to return a full vector correctly matching an input pattern, and took this to be the error rate. 
+I varied with sparsity along with the number of patterns. For each level of sparsity the proportion of $-1$s and $+1$s were fixed but these were then randomly sorted. I also ensured that all of the patterns were unique. I used networks with 100 units and tested up to 20 patterns. Here you can see that increasing sparsity and increasing the number of patterns both increases the error rate (figure \ref{fig:heatmap1}). Performance deteriorated significantly after the theoretical $N = 0.138I$ reported in the Mackay textbook.
+
+<<Make_patterns, echo = F, tidy = T>>=
+#Function to calculate number of things wrong
+calculate_errors <- function(v, patterns) {
+  min(apply(patterns, 2, function(x) (length(which(x != v)))))
+}
+
+#Function to make patterns
+make_patterns <- function(p, sparse) {
+  
+  #Make patterns  and weights - changed to fixed numbers of 1s and -1s - consider making permute so no repeats
+  patterns <- matrix(unlist(mclapply(1:p, function(i,...) {sample(c(rep(1, sparse), rep(-1, 100-sparse)))},
+                                     simplify = T, mc.cores = 32)), nrow = 100)
+  
+  #Make sure all patterns unique
+  patterns <- unique(patterns, MARGIN = 2)
+  
+  while(dim(patterns)[2] < p) {
+    
+    #Add an extra pattern, then remove duplicates and iterate
+    patterns <- cbind(patterns, replicate(p - dim(patterns)[2], sample(c(rep(1, sparse), rep(-1, 100-sparse)))))
+    patterns <- unique(patterns, MARGIN = 2)
+  }
+  
+  patterns
+}
+@
+
+<<Test_sparsity, echo = F, tidy = T, cache = T, warning= F>>=
+#Matrix to store results
+storage_capacity <- matrix(nrow = 99, ncol = 20)
+
+#Next basically run lots of times with different numbers of patterns and then plot this
+for (p in 1:20) {
+  #Try with 1:20 patterns
+  
+  for (sparse in 1:99) {
+    #Try with 0.01-0.99 distribution of -1 and 1
+    
+    #Make patterns and weights
+    patterns <- make_patterns(p, sparse)
+    weights <- make_weights(patterns)
+    
+    #Run network 100 times and get vectors returned - could multicore this more easily by wrapping all 3 following lines?
+    error <- replicate(100, update_network(weights))
+    error_matrix  <- matrix(unlist(error[1, 1:100]), nrow = 100)
+    
+    #Check number of errors in matrix
+    storage_capacity[sparse, p] <- length(which(apply(error_matrix, 2, calculate_errors, patterns) != 0))
+  }
+  
+}
+
+#Make it into a dataframe and plot as heatmap
+storage_df <- as_tibble(storage_capacity)
+colnames(storage_df) <- c(1:20)
+storage_df <- cbind(tibble(sparse = 1:99), storage_df)
+storage_tbl <- storage_df %>% gather(key = 'p', value = 'error', -sparse)
+storage_tbl$p <- as.numeric(storage_tbl$p)
+@
+\begin{figure}[H]
+\centering
+<<plot_sparsity, echo = F, fig = T, fig.height = 5, fig.width=10>>=
+#Consider changing colours here
+pal <- wes_palette("Zissou1", 100, type = "continuous")
+ggplot(storage_tbl, aes(y = sparse, x = p, fill= error)) + 
+  geom_tile() + theme_minimal() + xlab('number of patterns') + 
+  ylab('Percent positive bits') + 
+  labs(title = 'Heatmap of errors against sparsity and number of patterns stored', fill = 'Percentage error')
+@
+\caption{Heatmap of error rate, sparsity and number of patterns stored. This shows that the number of times the network is unable to correctly return a pattern given a random input pattern increases with increasing sparsity and increasing the number of patterns the network has to store}
+\label{fig:heatmap1}
+\end{figure}
+
+I also tested whether or not recall was impaired globally or if only certain patterns were returned as the network performance became impaired (figure \ref{fig:heatmap2}). I did this by minimally changing the input pattern by 2 bits and testing the network, repeating this 100 times to see if it was able to return the original pattern. I did this for all patterns. For the hebbian storage the network was able to store and return all patterns up to a threshold, but after this threshold it had a decreasing proportion of patterns it could store, and increasing sparsity made the storage fall to zero. The network was able to return many patterns even well above the point were the performance was zero, and well above the $N = 0.138I$ threshold, showing that patterns were stored but the network was just unable to return them consistently.
+
+<<test_storage_minimal_change, echo = F, tidy = T, cache = T, warning = F>>=
+#Now test storage capacity
+#Matrix to store results
+storage_capacity_minimal <- matrix(nrow = 99, ncol = 30)
+
+#Function to randomly switch a proportion of weights check if the pattern input is returned
+minimal_change <- function(pattern, to_change) {
+  
+  #flip to_change number of weights
+  flipped <- sample(1:100, to_change)
+  pattern[flipped] <- pattern[flipped]*-1
+  
+  return(pattern)
+}
+
+#Function to check if the same vector is returned given a random switch
+same_returned <- function(pattern, weights, to_change) {
+  
+  for (i in 1:100) {
+    #Randomly flip some weights
+  changed_pattern <- minimal_change(pattern, to_change)
+  
+  #Check network
+  returned_pattern <- update_network(weights, changed_pattern)[[1]]
+  
+  #if pattern correct stop and return 1 else continue
+  if (length(which(pattern == returned_pattern)) == 100) {
+    return(1)
+    break
+    }
+  
+  }
+  return(0)
+    
+}
+
+update_network <- function(weights, pattern = NA) {
+  #Function to update network 
+  
+  #specify N
+  N <- dim(weights)[1]
+  
+  #Randomly choose a pattern to test
+  if (is.na(pattern) == T) {
+    v <- sample(c(1,-1), size = N, replace = TRUE)
+  } else {
+    v <- pattern
+  }
+  
+  
+  #Calculate energy
+  energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
+  delta_E <- 10
+  
+  #Frame to track energy
+  energies <- c(energy)
+  delta_Es <- c(0)
+  deltas <- c(0)
+  iterator <- 2
+  
+  #Only allow sign to flip twice
+  sign_flip <- 0
+  
+  while (delta_E != 0) {
+    
+    #Set order to take
+    order <- sample(1:N)
+    delta <- 0
+    
+    #Work through the units in a random order
+    for (i in order) {
+      sgn_sum <- sum(v * weights[i,])
+      
+      #Do sgn_sum
+      if (sgn_sum > 0) {new_v <- 1
+      #} else if (sgn_sum == 0) {new_v <- 0
+      } else {new_v <- -1}
+      
+      #Check if need to keep updating units, update them
+      if (new_v != v[i]) {
+        delta <- delta + 1
+        v[i] <- new_v
+      }
+    }
+    
+    #Calculate energy
+    new_energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
+    delta_Es[iterator] <- delta_E <- new_energy - energy
+    energies[iterator] <- energy <- new_energy
+    deltas[iterator] <- delta
+    
+    #Iterate
+    iterator <- iterator + 1
+    
+    #If it doesn't match one of the patterns switch the sign
+    if (delta_E == 0 & sign_flip <= 2) {
+      
+      #Check if any patterns identical to current units
+      is_identical <- min(apply(patterns, 2, function(x) (length(which(x != v)))))
+      
+      if (is_identical != 0) {
+        
+        #Invert and increase energy
+        v <- -v
+        delta_E <- 1
+        
+        sign_flip <- sign_flip + 1  
+        
+      }
+    }
+  }
+  
+  return(list(v, data.frame(delta_Es, energies, deltas)))
+}
+
+#Next basically run lots of times with different numbers of patterns and then plot this
+for (p in 1:30) {
+  #Try with 1:20 patterns
+  
+  for (sparse in 1:99) {
+    #Try with 0.01-0.99 distribution of -1 and 1
+    
+    #Make patterns and weights
+    patterns <- make_patterns(p, sparse)
+    weights <- make_weights(patterns)
+    
+    number_remembered <- 0
+    
+    #For each pattern see if it can be returned with minimal change
+    for (i in 1:p) {
+      
+      pattern <- patterns[,(i %% p + 1)]
+      number_remembered <- number_remembered + same_returned(pattern, weights, 2)
+      
+    }
+    
+    proportion_remembered <- number_remembered/p
+    
+    #Check number of errors in matrix
+    storage_capacity_minimal[sparse, p] <- proportion_remembered
+  }
+
+}
+@
+
+\begin{figure}[H]
+\centering
+<<plot_storage_minimal_change, echo = F, fig = T, fig.height = 5, fig.width = 10, warning = F>>=
+#Make it into a dataframe and plot as heatmap
+storage_minimal_df <- as_tibble(storage_capacity_minimal)
+colnames(storage_minimal_df) <- c(1:30)
+storage_minimal_df <- cbind(tibble(sparse = 1:99), storage_minimal_df)
+storage_minimal_tbl <- storage_minimal_df %>% gather(key = 'p', value = 'error', -sparse)
+storage_minimal_tbl$p <- as.numeric(storage_minimal_tbl$p)
+
+#Consider changing colourse here
+ggplot(storage_minimal_tbl, aes(y = sparse, x = p, fill= error)) + 
+  geom_tile() + theme_minimal() + xlab('number of patterns') + 
+  ylab('percent positive bits') + 
+  scale_fill_gradient2() + 
+  labs(title = 'Proportion of stored patterns network is able to return', fill = 'Proportion of stored patterns returned')
+@
+\caption{Heatmap of proportion of stored patterns network is able to return, sparsity and and number of patterns. This shows that as the network performs less well it is still able to return all patterns, but after this threshold it had a decreasing proportion of patterns it could store, and increasing sparsity made the storage fall to zero. }
+\label{fig:heatmap2}
+\end{figure}
+
+\subsection{Loss of connections}
+Next I tested how the network responds to random connections being removed. I tested networks using different numbers of patterns stored and tested the recall of the network as weights were successively removed. I randomly set 1\% of weights to zero symmetrically, then retested the network as above. I used 50\% $-1$, 50\% $+1$ split to set the patterns but as above I randomly set the patterns and input vectors the network was tested on. 
+
+As you can see increasing the number of patterns meant that the network performance fell more quickly when connections were lost (figure \ref{fig:weightloss1}). However with few patterns the network was remarkably resilient to loss of connections. This is the power of associative memory - memory isn't entirely erased when connections are lost. In fact some sparsity seems to make the network perform better with a limited number of patterns. Whilst this could be an artefact the human brain is certainly not fully connected so this may match the biological truth.
+
+<<weight_loss, echo = F, cache = T>>=
+#Now try deleting some of the weights randomly
+#Use 50/50 sparseness but randomly delete weights in order, try with different numbers of patterns
+weight_loss <- matrix(ncol = 5, nrow = 100)
+
+#Make order to delete weights
+order <- sample(1:4950)
+order_ref <- data.frame(row = rep(1:99, times = 99:1),
+                        col = unlist(sapply(c(2:100), seq, to = 100)))
+
+#Function to zero off weights
+zero_weights <- function(loc) {
+  weights[order_ref$i[order[(loc-99):loc]], order_ref$j[order[(loc-99):loc]]] <<- 0
+}
+
+for (p in seq(4, 12, 2)) {
+  
+  #Make patterns  and weights
+  patterns <- make_patterns(p, 50)
+  weights <- make_weights(patterns)
+  
+  #Run network 100 times and get vectors returned
+  error <- replicate(100, update_network(weights))
+  error_matrix  <- matrix(unlist(error[seq(1, 100, by = 2)]), nrow = 100)
+  
+  #Check number of errors in matrix
+  weight_loss[1, (p - 4)/2 + 1] <- length(which(apply(error_matrix, 2, calculate_errors, patterns) != 0))
+  
+  for (i in 1:99) {
+    
+    #Randomly sequentially set some weights to 0
+    for (j in 1:50) {
+      
+      #Ensure weights are symmetrically deleted
+      weights[order_ref$row[order[(i-1)*50 + j]], order_ref$col[order[(i-1)*50 + j]]] <- 0
+      weights[order_ref$col[order[(i-1)*50 + j]], order_ref$row[order[(i-1)*50 + j]]] <- 0
+    }
+    
+    #Run network 100 times and get vectors returned
+    error <- replicate(100, update_network(weights))
+    error_matrix  <- matrix(unlist(error[seq(1, 100, by = 2)]), nrow = 100)
+    
+    #Check number of errors in matrix
+    weight_loss[i + 1, (p - 4)/2 + 1] <- length(which(apply(error_matrix, 2, calculate_errors, patterns) != 0))
+  }
+}
+@
+\begin{figure}[H]
+\centering
+<<plot_weight_loss, fig = T, echo = F, fig.height = 5, fig.width = 10>>=
+#Plot errors
+ggplot() + geom_smooth(aes(x = 1:100, y = 100- weight_loss[,1], col = as.factor(4)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss[,2], col = as.factor(6)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss[,3], col = as.factor(8)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss[,4], col = as.factor(10)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss[,5], col = as.factor(12)), method = loess, formula = 'y ~ x', se = F) +
+  geom_point(aes(x = 1:100, y = 100- weight_loss[,1], col = as.factor(4))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss[,2], col = as.factor(6))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss[,3], col = as.factor(8))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss[,4], col = as.factor(10))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss[,5], col = as.factor(12))) +
+  theme_minimal() +
+  ylab("Percent simulations correct") + xlab('Percent of weights removed') + 
+  labs(title = 'Network performance as connections lost', col = 'Number of patterns stored')
+@
+\caption{Graph showing the network error as connections were symmetrically lost. Here you can see that increasing the number of patterns stored mean that the network performance degraded more quickly when connections were lost.}
+\label{fig:weightloss1}
+\end{figure}
+
+\subsection{Non-hebbian storage}
+I made a function to update the weights using the algorithm from the Mackay book (p. 516). In brief, I initialised the weights as above using the hebbian learning method. Following the algorithm, I calculated the error and used this to calculate the gradient, which I used to repeatedly update the weight matrix. I found that after around 75 iterations the weights stopped changing (not shown) so to ensure that in all cases the weights had settled I iterated this 100 times. I chose not to check whether or not the weights had stopped changing significantly as in my testing it consistently stopped changing at 75 iterations. 
+
+Next I tested the best values of epsilon and alpha (not shown). I found $\alpha = 0.6$ and $\epsilon = 0.04$ to be the optimum parameters and as such used these throughout. 
+
+<<non_heb_update, echo = F, cache = T>>=
+#Make t function
+do_t <- function(x) {
+  sapply(x, function(y) (ifelse(y == 1, 1, 0)))
+}
+
+non_heb_update <- function(x, alpha, epsilon) {
+  #Function to make non-hebbian update
+  N <- dim(x)[1]
+  
+  #Get hebbian weights
+  w <- make_weights(patterns)
+  
+  #Monitor progress
+  #delta_ws <- c()
+  
+  for (l in 1:100) {
+    
+    #Calculate al activations
+    a <- t(x) %*% w
+    
+    #Do sigmoidal (compute outputs)
+    y <- 1/(1+exp(-a)) 
+    
+    #Calculate t function - -1 -> 0
+    t <- t(apply(x, 2, do_t))
+    
+    #Calculate error
+    e <- t - y
+    
+    #Calculate gradient
+    gw <- x %*% e
+    
+    #Symmetrise gradient
+    gw <- gw + t(gw)
+    
+    #Update weights
+    delta_w <- epsilon * (gw - alpha*w)
+    w <- w + delta_w
+    #delta_ws[l] <- sum(abs(delta_w))
+    
+    #Enforce all self weights to be zero
+    for (i in 1:N) {
+      w[i,i] <-  0
+    }
+    
+  }
+  
+  return(w)
+}
+@
+
+<<test_alpha_eps, echo = F, cache = T, eval = F>>=
+#Make some patterns to test, some storage
+patterns <- make_patterns(15, 50)
+alpha_epsilon_test <- matrix(nrow = 10, ncol = 10)
+alphas <- seq(0.1, 1, 0.1)
+epsilons <- seq(0.01, 0.1, 0.01)
+
+#Test different values of epsilon and alpha
+for (i in 1:10) {
+  #Test different values of alpha
+  
+  for (j in 1:10) {
+    #Test differnt values of epsilon
+    w <- non_heb_update(patterns, alphas[i], epsilons[j])
+    
+    #Run network 100 times and get vectors returned
+    error <- replicate(1000, update_network(w))
+    error_matrix  <- matrix(unlist(error[seq(1, 100, by = 2)]), nrow = 100)
+    alpha_epsilon_test[i, j] <- length(which(apply(error_matrix, 2, calculate_errors, patterns) != 0))
+    
+  }
+}
+@
+<<plot_test_alpha, echo = F, fig = T, fig.height = 5, fig.width = 10, warning = F, eval = F>>=
+#Plot the output
+#Make it into a dataframe and plot as heatmap
+alpha_epsilon_df <- as_tibble(alpha_epsilon_test)
+colnames(alpha_epsilon_df) <- epsilons
+alpha_epsilon_df <- cbind(tibble(alphas), alpha_epsilon_df)
+alpha_epsilon_tbl <- alpha_epsilon_df %>% gather(key = 'epsilon', value = 'error', -alphas)
+alpha_epsilon_tbl$name <- as.numeric(alpha_epsilon_tbl$name)
+
+#Consider changing colours here
+ggplot(alpha_epsilon_tbl, aes(y = name, x = alphas, fill= error)) + 
+  geom_tile() + theme_minimal() + xlab('alpha') + 
+  ylab('epsilon') + 
+  labs(title = 'Network performance with different alpha and epsilon', fill = 'Percentage error')
+@
+
+
+\subsubsection{Testing storage capacity of non-hebbian update}
+Next I tested the storage capacity of the network following the non-hebbian update. Again I used a fixed proportion of randomly sorted positive and negative bits for the pattern. Here you can see the the network performs significantly better following the non-hebbian update than the hebbian method (figure \ref{fig:heatmap3}). Additionally some degree of scarcity seems to make the network able to store more patterns, with the optimum around 10\%. This is likely due to the way the the non-hebbian update works and shows that using an optimisation algorithm significantly increases network storage, well above the storage threshold for the hebbian learning method. 
+
+I also tested what proportion of the patterns the network was able to return as above (figure \ref{fig:minimal_heatmap}). For this the network was able to store and return correctly (given sufficient opportunity) a very large number of patterns. However after a certain threshold as above storage became patchy, alternating between 100\% and 0\%. Again increasing sparsity reduced this threshold. The threshold being this high might explain why the lowest performance in the above heatmap was 50\%.
+
+<<test_nh_storage, echo = F, tidy = T, cache = T>>=
+#Now test storage capacity
+#Matrix to store results
+storage_capacity_nh <- matrix(nrow = 99, ncol = 50)
+
+#Next basically run lots of times with different numbers of patterns and then plot this
+for (p in 1:50) {
+  #Try with 1:20 patterns
+  
+  for (sparse in 1:99) {
+    #Try with 0.01-0.99 distribution of -1 and 1
+    
+    #Make patterns and weights
+    patterns <- make_patterns(p, sparse)
+    weights <- non_heb_update(patterns, 0.6, 0.04)
+    
+    #Run network 100 times and get vectors returned
+    error <- replicate(100, update_network(weights))
+    error_matrix  <- matrix(unlist(error[seq(1, 100, by = 2)]), nrow = 100)
+    
+    #Check number of errors in matrix
+    storage_capacity_nh[sparse, p] <- length(which(apply(error_matrix, 2, calculate_errors, patterns) != 0))
+  }
+  
+}
+@
+
+\begin{figure}[H]
+\centering
+<<plot_nh_storage, echo = F, fig = T, fig.height = 5, fig.width = 10, warning = F>>=
+#Make it into a dataframe and plot as heatmap
+storage_nh_df <- as_tibble(storage_capacity_nh)
+colnames(storage_nh_df) <- c(1:50)
+storage_nh_df <- cbind(tibble(sparse = 1:99), storage_nh_df)
+storage_nh_tbl <- storage_nh_df %>% gather(key = 'p', value = 'error', -sparse)
+storage_nh_tbl$p <- as.numeric(storage_nh_tbl$p)
+
+#Consider changing colourse here
+ggplot(storage_nh_tbl, aes(y = sparse, x = p, fill= error)) + 
+  geom_tile() + theme_minimal() + xlab('number of patterns') + 
+  ylab('percent positive bits') + 
+  labs(title = 'Storage capacity of network following non-hebbian update', fill = 'Percentage error')
+@
+\caption{Heatmap showing network error with increasing number of patterns and varying sparsity. Here you can see that some degree of sparsity seems to improve network performance with increasing numbers of patterns stored.}
+\label{fig:heatmap3}
+\end{figure}
+
+<<test_nh_storage_minimal_change, echo = F, tidy = T, cache = T, warning = F, results = F>>=
+#Now test storage capacity
+#Matrix to store results
+storage_capacity_nh_minimal <- matrix(nrow = 99, ncol = 75)
+
+#Function to randomly switch a proportion of weights check if the pattern input is returned
+minimal_change <- function(pattern, to_change) {
+  
+  #flip to_change number of weights
+  flipped <- sample(1:100, to_change)
+  pattern[flipped] <- pattern[flipped]*-1
+  
+  return(pattern)
+}
+
+#Function to check if the same vector is returned given a random switch
+same_returned <- function(pattern, weights, to_change) {
+  
+  for (i in 1:100) {
+    #Randomly flip some weights
+  changed_pattern <- minimal_change(pattern, to_change)
+  
+  #Check network
+  returned_pattern <- update_network(weights, changed_pattern)[[1]]
+  
+  #if pattern correct stop and return 1 else continue
+  if (length(which(pattern == returned_pattern)) == 100) {
+    return(1)
+    break
+    }
+  
+  }
+  return(0)
+    
+}
+
+update_network <- function(weights, pattern = NA) {
+  #Function to update network 
+  
+  #specify N
+  N <- dim(weights)[1]
+  
+  #Randomly choose a pattern to test
+  if (is.na(pattern) == T) {
+    v <- sample(c(1,-1), size = N, replace = TRUE)
+  } else {
+    v <- pattern
+  }
+  
+  
+  #Calculate energy
+  energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
+  delta_E <- 10
+  
+  #Frame to track energy
+  energies <- c(energy)
+  delta_Es <- c(0)
+  deltas <- c(0)
+  iterator <- 2
+  
+  #Only allow sign to flip twice
+  sign_flip <- 0
+  
+  while (delta_E != 0) {
+    
+    #Set order to take
+    order <- sample(1:N)
+    delta <- 0
+    
+    #Work through the units in a random order
+    for (i in order) {
+      sgn_sum <- sum(v * weights[i,])
+      
+      #Do sgn_sum
+      if (sgn_sum > 0) {new_v <- 1
+      #} else if (sgn_sum == 0) {new_v <- 0
+      } else {new_v <- -1}
+      
+      #Check if need to keep updating units, update them
+      if (new_v != v[i]) {
+        delta <- delta + 1
+        v[i] <- new_v
+      }
+    }
+    
+    #Calculate energy
+    new_energy <- -0.5 * sum(weights[1:N, 1:N] * (v[1:N] %*% t(v[1:N])))
+    delta_Es[iterator] <- delta_E <- new_energy - energy
+    energies[iterator] <- energy <- new_energy
+    deltas[iterator] <- delta
+    
+    #Iterate
+    iterator <- iterator + 1
+    
+    #If it doesn't match one of the patterns switch the sign
+    if (delta_E == 0 & sign_flip <= 2) {
+      
+      #Check if any patterns identical to current units
+      is_identical <- min(apply(patterns, 2, function(x) (length(which(x != v)))))
+      
+      if (is_identical != 0) {
+        
+        #Invert and increase energy
+        v <- -v
+        delta_E <- 1
+        
+        sign_flip <- sign_flip + 1  
+        
+      }
+    }
+  }
+  
+  return(list(v, data.frame(delta_Es, energies, deltas)))
+}
+
+#Next basically run lots of times with different numbers of patterns and then plot this
+for (p in 1:75) {
+  #Try with 1:20 patterns
+  
+  for (sparse in 1:99) {
+    #Try with 0.01-0.99 distribution of -1 and 1
+    
+    #Make patterns and weights
+    patterns <- make_patterns(p, sparse)
+    weights <- non_heb_update(patterns, 0.6, 0.04)
+    
+    number_remembered <- 0
+    
+    #For each pattern see if it can be returned with minimal change
+    for (i in 1:p) {
+      
+      pattern <- patterns[,(i %% p + 1)]
+      number_remembered <- number_remembered + same_returned(pattern, weights, 2)
+      
+    }
+    
+    proportion_remembered <- number_remembered/p
+    
+    #Check number of errors in matrix
+    storage_capacity_nh_minimal[sparse, p] <- proportion_remembered
+
+  }
+
+}
+@
+
+\begin{figure}[H]
+\centering
+<<plot_nh_storage_minimal_change, echo = F, fig = T, fig.height = 5, fig.width = 10, warning = F>>=
+#Make it into a dataframe and plot as heatmap
+storage_nh_minimal_df <- as_tibble(storage_capacity_nh_minimal)
+colnames(storage_nh_minimal_df) <- c(1:75)
+storage_nh_minimal_df <- cbind(tibble(sparse = 1:99), storage_nh_minimal_df)
+storage_nh_minimal_tbl <- storage_nh_minimal_df %>% gather(key = 'p', value = 'error', -sparse)
+storage_nh_minimal_tbl$p <- as.numeric(storage_nh_minimal_tbl$p)
+
+#Consider changing colourse here
+ggplot(storage_nh_minimal_tbl, aes(y = sparse, x = p, fill= error)) + 
+  geom_tile() + theme_minimal() + xlab('number of patterns') + 
+  ylab('percent positive bits') + 
+  scale_fill_gradient2() + 
+  labs(title = 'Proportion of patterns network is able to return', fill = 'Proportion of patterns returned')
+@
+\caption{Heatmap showing proportion of patterns the network was able to return. Here you can see that the network is able to return all of the patterns up to a very high threshold given enough chances however after a certain threshold storage becomes patchy.}
+\label{fig:minimal_heatmap}
+\end{figure}
+
+\subsection{Testing memory loss}
+Next I tested to see if the non-hebbian method had better performance when weights were lost. After the non-hebbian update, networks with more stored patterns were more resilient to loss of connections than with the hebbian weight setting. 
+
+<<non_heb_weight_loss, echo = F, cache = T>>=
+#Now try deleting some of the weights randomly
+#Use 50/50 sparseness but randomly delete weights in order, try with different numbers of patterns
+weight_loss_nh <- matrix(ncol = 7, nrow = 100)
+
+for (p in seq(4, 16, 2)) {
+  
+  #Make patterns  and weights
+  patterns <- make_patterns(p, 50)
+  weights <- non_heb_update(patterns, 0.6, 0.04)
+  
+  #Run network 100 times and get vectors returned
+  error <- replicate(100, update_network(weights))
+  error_matrix  <- matrix(unlist(error[seq(1, 100, by = 2)]), nrow = 100)
+  
+  #Check number of errors in matrix
+  weight_loss_nh[1, (p - 4)/2 + 1] <- length(which(apply(error_matrix, 2, calculate_errors, patterns) != 0))
+  
+  for (i in 1:99) {
+    
+    #Randomly sequentially set some weights to 0
+    for (j in 1:50) {
+      
+      #Ensure weights are symmetrically deleted
+      weights[order_ref$row[order[(i-1)*50 + j]], order_ref$col[order[(i-1)*50 + j]]] <- 0
+      weights[order_ref$col[order[(i-1)*50 + j]], order_ref$row[order[(i-1)*50 + j]]] <- 0
+    }
+    
+    #Run network 100 times and get vectors returned
+    error <- replicate(100, update_network(weights))
+    error_matrix  <- matrix(unlist(error[seq(1, 100, by = 2)]), nrow = 100)
+    
+    #Check number of errors in matrix
+    weight_loss_nh[i + 1, (p - 4)/2 + 1] <- length(which(apply(error_matrix, 2, calculate_errors, patterns) != 0))
+  }
+}
+@
+
+\begin{figure}[H]
+\centering
+<<plot_nh_wl, echo = F, fig = T, fig.height = 5, fig.width = 10>>=
+#Plot errors
+ggplot() + geom_smooth(aes(x = 1:100, y = 100- weight_loss_nh[,1], col = as.factor(4)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss_nh[,2], col = as.factor(6)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss_nh[,3], col = as.factor(8)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss_nh[,4], col = as.factor(10)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss_nh[,5], col = as.factor(12)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss_nh[,6], col = as.factor(14)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_smooth(aes(x = 1:100, y = 100- weight_loss_nh[,7], col = as.factor(16)), method = loess, formula = 'y ~ x', se = F) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss_nh[,1], col = as.factor(4))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss_nh[,2], col = as.factor(6))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss_nh[,3], col = as.factor(8))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss_nh[,4], col = as.factor(10))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss_nh[,5], col = as.factor(12))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss_nh[,6], col = as.factor(14))) + 
+  geom_point(aes(x = 1:100, y = 100- weight_loss_nh[,7], col = as.factor(16))) + 
+  theme_minimal() +
+  ylab("Percent correctly of simulations where whole vector matches an input pattern") + xlab('Percent of weights removed') + 
+  labs(title = 'Network performance when weights lost', col = 'Number of patterns stored')
+@
+\caption{Graph showing network performance as connections are lost after non-hebbian training. Here you can see that although network performance degrades in a similar fashion to the hebbian trained network the network is able to store more weights whilst maintaining performance as connections are removed.}
+\label{fig:weight_loss_nh}
+\end{figure}
+
+\newpage
+\section{Word2Vec}
+\subsection{Introduction}
+One of the challenges of natural language processing (NLP) is that models must use a numerical representation of words such that the neural network can output or take input of a series of words. Prior to Word2Vec words were represented as n-grams (sequences of words seen in order) and trillions of these had been generated \cite{brants-etal-2007-large}. However the problem with n-grams is that they do not take into account any degree of semantic similarity. 
+
+Word2Vec was first proposed by Mikolov et al \cite{41224} and is a method for generating vector representations of words. The aim is to generate multidimensional vectors such that semantically similar words are close to each other in high-dimensional space. After training their network the authors subsequently found that not only are semantically similar words close in high dimensional space but pairs of words with similar relationships to each other had similar vectors to travel from one word to another. An example is this result $Paris - France + Italy = Rome$. Here we can see that adding Italy to the difference between France and Paris gives Rome – the semantic difference between Paris and France is itself represented as a vector. These sorts of results will be covered in more detail later on in this essay and reproduced. 
+
+\subsection{Method}
+Word2Vec utilises two sorts of neural network architectures to produce these vectors: the Continuous Bag of Words (CBOW) and Skip-Gram models. Both of these architectures were tested in this initial paper. Both models are neural networks that take one-hot encoded words as their inputs, put these words through a large hidden layer and then output further one-hot encoded words. They are trained using the same corpus of data once they are trained the weights are frozen. 
+
+	However CBOW and the Skip-gram model effectively do the inverse of each other (see figure \ref{fig:CBOW}). In CBOW, the network is trained to predict a missing word given the words surrounding it, continuously throughout the sentence where the order of the other words do not influence the projection (in contrast to previous BOW approaches). The skip-gram model does the opposite – given a single word the network is trained to predict the words before or after it. They both depend on the premise that the semantic and syntactic meaning of a word can be inferred by the company it keeps (the words surrounding it). 
+	
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.4]{CBOW_skip_gram.png}
+\caption{Figure showing the CBOW (left) and skip-gram models (right) from Mikolov \emph{et al.}}
+\label{fig:CBOW}
+\end{figure}
+
+	
+	Once the networks have been trained the weights are frozen and the hidden layer activations for any given word are exported as vectors.
+
+\subsection{CBOW vs Skip-Gram}
+Mikolov \emph{et al.} found that while overall the CBOW model worked better than the skip-gram model, the CBOW performed better on syntactic accuracy and skip-gram better at semantic accuracy. This makes sense - the CBOW model has significantly more syntactic information as input (as it has multiple words before and after) to help it learn this information, whilst the skip-gram model needs a better semantic 'understanding' to be able to predict multiple words surrounding the word it is given, but is given less syntactic information as input. Skip-gram by its nature encodes sparser words better as the CBOW model is less likely to predict an unusual word, and this might also explain its improved semantic performance. 
+
+\subsection{Common Results}
+Using the Word2Vec \cite{word2vec_2021} package in R it is possible to replicate some of the results from the paper (see tables). I used a pre-trained set of words here from the Word2vec package using the skip-gram model.  The power of Word2Vec means that not only are words that are semantically related close together, but the difference between pairs of words itself encodes semantic meaning. For example, calculating the vector which separates father from son and adding that to mother should give daughter, this is reproduced in table 1. 
+
+This model is powerful enough to detect these sorts of similarities between more sparsely used words. For example, $Policeman - Man  + Woman$ gives policewoman as its second hit (table 2), showing the system 'understands' the semantic difference between policeman and policewoman, and this system was able to reproduce other famous findings such as cities. For some reason, the vector of difference often seemed quite small and so would give the initial input as the top hit - this could be that these libraries were trained on small sets of words. 
+
+<<Word2Vec_examples, echo = F, tidy = T, results = T>>=
+library(word2vec)
+model <- read.word2vec(file = "cb_ns_500_10.w2v", normalize = TRUE)
+wv <- predict(model, newdata = c("king", "man", "woman"), type = "embedding")
+wv <- wv["king", ] - wv["man", ] + wv["woman", ]
+man_king <- predict(model, newdata = wv, type = "nearest", top_n = 3)
+
+wv <- predict(model, newdata = c("son", "father", "mother"), type = "embedding")
+wv <- wv["son", ] - wv["father", ] + wv["mother", ]
+woman_son <- predict(model, newdata = wv, type = "nearest", top_n = 3)
+kable(list(man_king, woman_son), caption = 'Top 3 hits for King - Man + Woman (left), Son - Father + Mother (right)')
+
+wv <- predict(model, newdata = c("policeman", "man", "woman"), type = "embedding")
+wv <- wv["policeman", ] - wv["man", ] + wv["woman", ]
+policeman_man <- predict(model, newdata = wv, type = "nearest", top_n = 3)
+
+wv <- predict(model, newdata = c("paris", "germany", "france"), type = "embedding")
+wv <- wv["paris", ] - wv["france", ] + wv["germany", ]
+paris_france <- predict(model, newdata = wv, type = "nearest", top_n = 3)
+kable(list(policeman_man, paris_france), caption = 'Top 3 hits for Policeman - Man + Woman (left), Paris - France + Germany (right)')
+@
+
+\subsection{Uses in Computational Biology}
+Whilst the name Word2Vec implies that the inputs have to be words and be represented in feature space Word2Vec is not limited to linguistic uses. It can be applied to any problem to infer similarity between objects that occur in the context of other objects, often but not necessarily those which occur in a sequence, as the order of the inputs does not affect the outputs. This has been used extensively to investigate similarities between genes, peptides and other biological sequences. 
+
+For example, Du \emph{et al.}\cite{Du_Jia_Dai_Tao_Zhao_Zhi_2019}, used gene expression microarray data to cluster genes using a word2vec vector embedding followed by a t-SNE. They found that using this method the average similarity of genes within the same GO pathway was more than 50\% greater than those in different pathways. 
+
+A number of different groups have used it for predicting interactions between peptides. For example Dao \emph{et al.}\cite{Dao_Lv_Zhang_Zhang_Liu_Lin_2020} investigated the YY1 protein on chromatin, pairs of which dimerise to form a loop mediating enhancer-promoter activity in mammals. They used the CBOW method to represent the possible k-mers in YY1 loops as vectors and then trained a convolutional neural network to predict which combinations of k-mers in the proteins mediated loop formation, with an AUC of $\geq 0.93$. Similarly, Mostavi \emph{et al.}\cite{Mostavi_Salekin_Huang_2018} use a k-mer method to encode predict DNA methylation sites,  Woloszynek \emph{et al.}\cite{Woloszynek_Zhao_Chen_Rosen_2019} have used this approach for feature representations of bacterial rRNA and Shen \emph{et al.}\cite{Shen_Bao_Huang_2018} have used it for prediction of transcription factor binding sites.
+
+In fact, the potential of word2vec for computational biology is extensive, and has use cases from dimentionality reduction of fMRI connectome data\cite{rest2vec_2021}, prediction of protein-protein interaction and mutation pathogenicity using text-mining of PubMed \cite{Cox_Dong_Rai_Christopherson_Zheng_Tropsha_Schmitt_2020}\cite{Rehmat_Farooq_Kumar_Ul_Hussain_Naveed_2020} and improving biomedical word embeddings \cite{Zhang_Chen_Yang_Lin_Lu_2019}.
+
+\subsection{Other uses}
+This technique has been used extensively in the ecommerce sector, with examples including music recommendations on Spotify and other music streaming websites, listing recommendations on AirBnB and ad recommendations on Yahoo \cite{Applying_word2vec}.  A good example of this is song recommendations. As listeners often listen to playlists with songs that are similar to each other, and keep adjacent songs particularly similar, the application of Word2Vec allows a vector representation to be generated for each song. The music streaming service Anghami \cite{Karam_2017} has implemented this in their song recommendation algorithm. They used a one-hot encoding for the input and output, and a skip-gram approach for their network to maximise encoding for scarcely played songs; for music recommendations suggesting songs which users otherwise will not have listened to is important. They were able to show using a t-SNE of the vectors produced that similar songs are close to each other in clustering and songs which are very different are further away. 
+
+\subsection{Problems}
+One of the main problems with Word2Vec is that the corpus of literature that the system is trained on can introduce biases into the embeddings and perpetuate stereotypes such as gender stereotypes. In a seminal paper Bolukbasi \emph{et al.}\cite{Bolukbasi_Chang_Zou_Saligrama_Kalai_2016} were able to show some extreme gender biases in a number of frequently used trained corpuses. An example of this relevant to development of AI was the equivalence ‘man is to woman as computer programmer is to homemaker’, however the biases extended significantly beyond this. For example, they showed that home-maker, nurse, receptionist and librarian were strongly associated with the pronoun she whilst maestro, skipper, protege, philosopher, captain, architect and financier were strongly associated with he.
+
+ Similarly, an analysis by Straw and Callison-Burch \cite{Straw_Callison-Burch_2020} found associations between nationality, race and gender with different psychiatric conditions. They found the equivalence ‘British is to depression as Irish is to alcoholism’. They also found associations between gender labels such as queer with substance abuse and gender fluid with obsessive compulsive, associations between race labels such African American with schizoaffective disorder and Asian with compulsive hoarding.
+ 
+ \subsection{Summary}
+ Here you can see that Word2vec is a powerful tool for generating high-dimentional vector representations of words and other objects that occur in sequence. It is able to encode semantic and syntactic differences. However, as with any machine learning approach, if there are biases in the data it is trained on it can be biased in its encodings. 
+
+\section{Challenges Surrounding Reproducibility in Machine Learning Research}
+There are a number of challenges surrounding reproducibility in ML research and they risk making machine learning into a field dominated by a few big players who can afford to invest massive sums of money into research that cannot be reproduced and therefore built upon by others. There exist challenges at all steps of the experimental process, from the availability and pre-processing of training data, release of code used the build the networks, release of the trained network weights and the hyperparameters that were used in the final network, and availability of the large computational resources required to successfully train large networks. There also exist problems around the authorship of papers themselves, where the reason and source of improvements are obscured (either deliberately or otherwise) by the explanations.
+
+	McKinney \emph{et al.}\cite{McKinney_2020} published research demonstrating the utility of a deep learning approach in breast cancer detection. However they published minimal supplemental detail resulting in a response being published, and this interchange provides a perfect example of the challenges facing these sorts of studies.
+	
+\subsection{Definitions}
+To start, it is important to define the term reproducibility. This is defined by Liu \emph{et al.}\cite{Liu_Gao_Xia_Lo_Grundy_Yang_2020} as the ability to reproduce experimental findings using the same experimental protocol and model but new real-world data. It is important to distinguish this from replicability (as defined again by Liu \emph{et al.}) as the replication of experimental findings using the same protocol, model and the same data. 
+
+\subsection{Data and Processing}
+One of the first challenges is the issue of training data: its availability and processing. McKinney \emph{et al.} release neither their training data nor the methods for processing it. Their data is likely clinically privileged and difficult to release anonymously. In saying that, this is an area which has improved significantly in recent years, with more and more data released anonymously and guidelines developed for the anonymisation of data \cite{Keerie_Tuck_Milne_Eldridge_Wright_Lewis_2018}. For radiographical images there are whole websites such as Radiopaedia\cite{Radiopaedia.org} hosting thousands of anonymised clinical images showing that this is eminently possible. Given sufficient motivation release of data is not just possible but preferable, and without this data there is no chance to replicate these findings. Similarly if the data processing protocol is not released then even given the network structure and weights and the data it can be impossible to replicate findings from studies which can put reproducing findings with new data out of reach.
+
+\subsection{Network Structure and Hyperparameters}
+McKinney \emph{et al.}, do not release their network structure, or any sort of code book, and merely link to the generic TensorFlow image analysis GitHub. This is a common problem; a literature search by Liu \emph{et al.}, of papers in the software engineering field using deep learning models found that only a quarter have an accessible link to a replication package in their papers, a number that was significantly lower for papers including more than one model. A response to the McKinney paper by Haibe-Kains \emph{et al.}, \cite{Haibe-Kains_2020} point out that not only is the network structure missing (something which the original paper claimed was due to proprietary software libraries) but that for their training the majority of their hyperparameters were also missing.
+
+\subsection{Misattribution of Improvements}
+Related to this, Lipton and Steinhardt note that a frequent problem is that when papers do release their code or structure, they often attribute performance improvements to complex adjustments to the network structure, which can be misleading or obfuscatory \cite{Lipton_Steinhardt_2019}. They point to a number of papers which have investigated the source of the improvements, and found that in fact hyper-parameter optimisation is the source for many of these improvements. They found that vanilla networks often perform equally as well as ones with complex imnprovements with appropriate optimisation. They also note that papers often speculate about the reasons for the improvements but state these as accepted facts, which can exacerbate this problem.
+
+Hartley and Olsson \cite{dtoolAI_2020} have developed a package for tracking hyperparameters and annotating models with meta-data during training called dtoolAI. This sort of approach allows clarity about training and the source of improvements, and makes release of models alongside hyperparameters simpler and more complete. 
+
+\subsection{Computational Monopolies}
+Some of the most recent state of the art improvements in deep learning have been brought about by teams from large companies attempting to solve long-standing problems. In November 2020, DeepMind (a Google sister company) won the most recent edition of the CASP protein folding competition, using what they describe as ‘an attention-based neural network system, trained end-to-end’ \cite{AlphaFold}. They explain that they trained the network using 16 tensor processing units, which they say is equal to around 100-200 GPUs, run over a few weeks. They note that this is relatively modest to run relative to other recent deep learning advances, but what they describe is of the order of 100000 hours of GPU time, something that would only be available institutions with extremely large resources. They plan to release a paper but even with the data, code, weights and hyperparameters replication of this will be impossible for the vast majority of researchers. This raises the risk the field could become dominated by a small number of players who can afford to take part, and that advances like this may be effectively owned and licenced by companies such as Google.
+
+\subsection{Conclusion}
+Here we can see that there are a number of challenges facing reproducibility in machine learning, with problems arising at all stages of experimentation and authorship. Whilst these problems have the potential to derail ML research, they are actively being investigated and methods for avoiding them being generated, such as dtoolAI. Computational research has great potential to be open given the nature of computational research means code can easily be shared. This problem could easily get worse, better, or the field could simply fragment, splitting those who choose to share with those who do not. However where methods and code are not shared, or papers are written in a manner which is confusing or obfuscatory this will not move the field forward as there will not be clarity about how advances have been made.
+
+\section{Bibliography}
+
+\printbibliography
+\newpage
+\section{Appendix with code}
+<<Appendix, eval = F, tidy = T>>=
+<<Make_weights>>
+
+<<Update_network>>  
+  
+<<Make_patterns>> 
+  
+<<Test_sparsity>>
+  
+<<plot_sparsity>>
+  
+<<test_storage_minimal_change>>
+  
+<<plot_storage_minimal_change>>
+  
+<<weight_loss>>
+
+<<plot_weight_loss>>  
+  
+<<non_heb_update>>
+  
+<<test_alpha_eps>>
+  
+<<plot_test_alpha>>
+
+<<test_nh_storage>>
+  
+<<plot_nh_storage>>
+  
+<<test_nh_storage_minimal_change>>
+
+<<plot_nh_storage_minimal_change>>
+  
+<<non_heb_weight_loss>>
+  
+<<plot_nh_wl>>
+  
+<<Word2Vec_examples>>
+@
+\end{document}
